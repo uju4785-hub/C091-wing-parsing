@@ -1,0 +1,60 @@
+-- ============================================================
+-- 이 파일은 참조용입니다. Supabase에 이미 생성된 테이블 구조입니다.
+-- 실행하지 마세요. supabase.ts의 타입 정의와 일치해야 합니다.
+-- 마지막 동기화: 2026-03-20
+-- ============================================================
+
+-- ※ UUID vs bigint
+--   현재 id 컬럼은 bigint auto-increment(GENERATED ALWAYS AS IDENTITY) 입니다.
+--   Python uuid.uuid4()로 직접 지정하려면 Supabase 대시보드에서
+--   id 컬럼 타입을 uuid + DEFAULT gen_random_uuid()로 변경해야 합니다.
+--   변경 전까지는 자동 생성 bigint를 사용하며, wing_code가 사실상 고유 식별자입니다.
+
+-- parsing_wing_products (상품 본체)
+-- PK: id (auto-increment bigint)
+-- UNIQUE: wing_code  ← Python upsert on_conflict 기준
+--
+-- 실제 컬럼 목록 (supabase.ts Row):
+--   id                bigint  PK
+--   wing_code         text    UNIQUE NOT NULL
+--   name              text    NOT NULL
+--   sub_name          text    NULL
+--   model             text    NOT NULL
+--   product_url       text    NOT NULL
+--   image_url         text    NOT NULL
+--   description       text    NOT NULL
+--   opt1_title        text    NULL
+--   opt2_title        text    NULL
+--   regi_cond         int     DEFAULT 1
+--   prod_cond         int     DEFAULT 1
+--   prev_retail_price int     NULL   ← 가격 변동 시 이전 최소 판매가를 기록
+--   parsing_at        timestamptz
+--   update_at         timestamptz NOT NULL
+--   created_at        timestamptz
+--   resale_at         timestamptz NULL
+--   soldout_at        timestamptz NULL
+--
+-- ※ prev_retail_price 컬럼 추가 SQL (아직 적용 전이라면 실행 필요):
+--   ALTER TABLE parsing_wing_products
+--     ADD COLUMN IF NOT EXISTS prev_retail_price int NULL;
+--
+-- ❌ 존재하지 않는 컬럼 (절대 삽입 금지):
+--   brand, category, option_title, retail_price
+
+-- parsing_wing_options (상품 옵션)
+-- PK: id (auto-increment bigint)
+-- FK: product_id → parsing_wing_products.id
+--
+-- 실제 컬럼 목록 (supabase.ts Row):
+--   id           bigint  PK
+--   product_id   bigint  FK NOT NULL
+--   opt1_name    text    NOT NULL   ← 옵션1 값 (예: "아이보리")
+--   opt2_name    text    NOT NULL   ← 옵션2 값 (예: "L"), 없으면 ""
+--   option_cond  int     NOT NULL   ← 1=판매중, 2=품절
+--   option_stock int     DEFAULT 0
+--   cost_price   int     DEFAULT 0
+--   retail_price int     DEFAULT 0
+--   changed_at   timestamptz
+--
+-- ❌ 존재하지 않는 컬럼 (절대 삽입 금지):
+--   option_name, retail_price(products쪽), brand

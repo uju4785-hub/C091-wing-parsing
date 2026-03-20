@@ -1,0 +1,43 @@
+{
+  "sites": [
+    {
+      "name": "윙하우스",
+      "enabled": true,
+      "url": "https://winghouse.co.kr/category/%EC%A0%84%EC%B2%B4%EB%B3%B4%EA%B8%B0/134/",
+      "category_id": 134,
+      "max_pages": 185,
+      "parser": "winghouse_parser",
+      "selectors": {
+        "item":  "#prdList li",
+        "name":  "strong.name a",
+        "price": ".xans-product-listitem li",
+        "link":  ".thumbnail > a"
+      },
+      "supabase": {
+        "product_table":  "parsing_wing_products",
+        "option_table":   "parsing_wing_options",
+        "conflict_column": "wing_code"
+      }
+    },
+    {
+      "name": "예시 쇼핑몰 (비활성)",
+      "enabled": false,
+      "url": "https://example-shop.com/products",
+      "selectors": {
+        "item":  ".product-item",
+        "name":  ".product-name",
+        "price": ".product-price",
+        "link":  "a"
+      },
+      "supabase": {
+        "table":           "products",
+        "conflict_column": "url"
+      }
+    }
+  ],
+  "browser": {
+    "headless":   true,
+    "timeout_ms": 15000,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+  }
+}
