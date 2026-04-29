@@ -1,0 +1,38 @@
+# 윙하우스 상품 파서 — 매일 1회 (한국 자정 ≈ UTC 15:00) + 수동 실행
+name: Daily Winghouse Parse
+
+on:
+  schedule:
+    # 매일 15:00 UTC = 한국 표준시 00:00 (자정)
+    - cron: "0 15 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: winghouse-parse-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install Python dependencies (parser only)
+        run: |
+          pip install "playwright==1.58.0" "python-dotenv==1.2.2" "supabase==2.25.0"
+
+      - name: Install Chromium for Playwright
+        run: playwright install chromium --with-deps
+
+      - name: Run winghouse_parser
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python winghouse_parser.py --pages 9999
