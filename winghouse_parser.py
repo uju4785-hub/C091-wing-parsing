@@ -16,7 +16,7 @@ JS 추출 전략 (변경 없음):
   var product_name        → name
   ld+json image[0]        → image_url  (폴백: og:image)
   var option_name_mapper  → opt1_title / opt2_title / opt3_title  (#$% 구분자)
-  var option_stock_data   → 옵션 목록 (item_code, opt1~3_name, option_price, stock_number)
+  var option_stock_data   → 옵션 목록 (is_selling, use_soldout, stock_number, opt1~3_name …)
   ld+json offers          → option_code(sku) / opt1~3_name 폴백
   #prdDetail innerHTML    → description
 
@@ -29,7 +29,7 @@ import re
 import asyncio
 import logging
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -206,6 +206,34 @@ DETAIL_JS = r"""
         if (!opt3_title && oa[2]) opt3_title = oa[2].option_name || null;
     }
 
+    // item_code(옵션 value) 또는 라벨 일부로 option 매칭 → 실제로 선택 불가(disabled·품절 문구)인지
+    const optionSelectionBlockedInDom = (itemCode, labelParts) => {
+        const code = String(itemCode || '').trim();
+        const hints = (labelParts || []).map(s => String(s || '').trim()).filter(Boolean);
+        const optEls = document.querySelectorAll(
+            'select[id^="product_option_id"] option, select[name*="option"] option, ' +
+            'select.ec-product-button option, select[class*="option"] option'
+        );
+        for (const opt of optEls) {
+            const val = String(opt.value || '').trim();
+            if (val === '' || val === '*' || val === 'empty' || val === '0') continue;
+            let matched = false;
+            if (code && val === code) matched = true;
+            if (!matched && hints.length) {
+                const t = (opt.textContent || '').replace(/\s+/g, ' ').trim();
+                if (hints.every(h => h && t.indexOf(h) !== -1)) matched = true;
+            }
+            if (!matched) continue;
+            if (opt.disabled || opt.hasAttribute('disabled')) return true;
+            const tx = (opt.textContent || '').replace(/\s+/g, ' ').trim();
+            if (/\(품절\)|\[품절\]|품절|매진|sold\s*out|soldout/i.test(tx)) return true;
+            const cls = String(opt.className || '');
+            if (/soldout|sold-out|disabled|ec-product-disabled/i.test(cls)) return true;
+            return false;
+        }
+        return false;
+    };
+
     // ── option_stock_data: JSON 파싱 후 정규화 ───────────────────────────
     let options_raw = [];
     const stockData = get('option_stock_data');
@@ -221,14 +249,38 @@ DETAIL_JS = r"""
             // 구 배열 형식 → item_code 없음 (Python 측에서 합성)
             options_raw = _parsed.map(item => ({ ...item, item_code: '' }));
         } else if (typeof _parsed === 'object') {
-            // 신 오브젝트 형식 → key = item_code, opt1~3_name 직접 추출
+            // 신 오브젝트 형식 (Cafe24 aOptionStockData / option_stock_data)
+            // → key = item_code, is_selling 이 실제 판매·선택 가능 여부에 가장 가깝게 옴
             for (const key of Object.keys(_parsed)) {
                 const item = _parsed[key];
                 const origVals = Array.isArray(item.option_value_orginal) ? item.option_value_orginal : [];
-                // 방어 코드: is_selling 누락/null → 'T'(판매 중), use_soldout 누락/null → 'F'(품절 아님)
-                // || 연산자는 빈 문자열도 폴백시키므로 ?? 연산자(nullish coalescing) 사용
-                const isSelling  = (item.is_selling  != null) ? String(item.is_selling)  : 'T';
-                const useSoldout = (item.use_soldout != null) ? String(item.use_soldout) : 'F';
+                const sn = Number(item.stock_number);
+                const stockSafe = Number.isFinite(sn) ? sn : 0;
+                const useSoldoutRaw = (item.use_soldout != null && String(item.use_soldout).trim() !== '')
+                    ? String(item.use_soldout).toUpperCase().trim()
+                    : 'F';
+                const useSoldout = useSoldoutRaw === 'T' ? 'T' : 'F';
+
+                let isSellingStr = 'T';
+                if (item.is_selling != null && String(item.is_selling).trim() !== '') {
+                    isSellingStr = String(item.is_selling).toUpperCase().trim() === 'T' ? 'T' : 'F';
+                }
+
+                let optionSelectionBlocked = false;
+                let isSoldout = false;
+
+                if (isSellingStr === 'F') {
+                    isSoldout = true;
+                } else if (stockSafe > 0) {
+                    isSoldout = false;
+                } else {
+                    // is_selling === 'T' 이고 재고 0: 쇼핑몰 설정상 주문 가능한 경우가 많음 → DOM에서 선택 막힘일 때만 품절
+                    optionSelectionBlocked = optionSelectionBlockedInDom(key, origVals);
+                    isSoldout = optionSelectionBlocked;
+                }
+
+                const finalSelling = isSoldout ? 'F' : 'T';
+
                 options_raw.push({
                     item_code:    key,
                     opt1_name:    origVals[0] || '',
@@ -237,8 +289,9 @@ DETAIL_JS = r"""
                     option_value: item.option_value || origVals.join('-'),
                     option_price: item.option_price || 0,
                     stock_number: item.stock_number  || 0,
-                    is_selling:   isSelling,
+                    is_selling:   finalSelling,
                     use_soldout:  useSoldout,
+                    option_selection_blocked: optionSelectionBlocked,
                 });
             }
         }
@@ -248,13 +301,21 @@ DETAIL_JS = r"""
     if (!options_raw.length && Array.isArray(oa)) {
         for (const grp of oa) {
             for (const v of (grp.option_value || [])) {
+                const st = Number(v.stock);
+                const stockOk = Number.isFinite(st) && st > 0;
+                const dataBlocked = (v.stock_display === 'F' || String(v.soldout).toUpperCase() === 'T');
+                let domBlocked = false;
+                if (!stockOk && !dataBlocked) {
+                    domBlocked = optionSelectionBlockedInDom('', [v.value || '']);
+                }
+                const blocked = dataBlocked || domBlocked;
                 options_raw.push({
                     item_code:       '',
                     option_value:    v.value || '',
                     option_price:    String(v.price_add || 0),
                     stock_number:    String(v.stock || 0),
-                    option_disabled: (v.stock_display === 'F' || String(v.soldout).toUpperCase() === 'T')
-                                     ? 'T' : 'F',
+                    option_disabled: blocked ? 'T' : 'F',
+                    option_selection_blocked: domBlocked,
                 });
             }
         }
@@ -263,6 +324,27 @@ DETAIL_JS = r"""
     // ── ld+json offers: option_code(sku) 보조 및 opt1~3_name 분리 폴백 ──
     // offers[].name 형식 예: "블루-S-기본" → opt1: 블루, opt2: S, opt3: 기본
     let offers_json = [];
+    let any_offer_in_stock = false;
+    const _availInstock = (av) => String(av || '').toLowerCase().includes('instock');
+    const _scanGraphInstock = (node) => {
+        if (!node || typeof node !== 'object') return false;
+        let off = node.offers;
+        if (off && typeof off === 'object' && !Array.isArray(off) && off.offers) off = off.offers;
+        const list = Array.isArray(off) ? off : (off ? [off] : []);
+        for (const o of list) {
+            if (_availInstock(o && o.availability)) return true;
+        }
+        if (Array.isArray(node['@graph'])) {
+            for (const g of node['@graph']) if (_scanGraphInstock(g)) return true;
+        }
+        return false;
+    };
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+        try {
+            const data = JSON.parse(script.textContent || '');
+            if (_scanGraphInstock(data)) any_offer_in_stock = true;
+        } catch(e) {}
+    }
     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
         try {
             const data = JSON.parse(script.textContent || '');
@@ -275,8 +357,9 @@ DETAIL_JS = r"""
                     sku:      String(o.sku || o['@id'] || '').trim(),
                     name:     String(o.name || '').trim(),
                     price:    parseFloat(String(o.price || 0)) || 0,
-                    in_stock: String(o.availability || '').toLowerCase().includes('instock'),
+                    in_stock: _availInstock(o && o.availability),
                 }));
+                if (offers_json.some(o => o.in_stock)) any_offer_in_stock = true;
                 break;
             }
         } catch(e) {}
@@ -304,6 +387,7 @@ DETAIL_JS = r"""
         name, image_url, base_price, custom_code,
         opt1_title, opt2_title, opt3_title,
         options_raw, offers_json,
+        any_offer_in_stock,
         description,
         is_totally_sold_out,
         is_soldout_icon_str,   // 디버그용 원시값 ('T' | 'F' | '')
@@ -398,6 +482,31 @@ def _cond_label(cond: int) -> str:
     return "판매중" if cond == 1 else "품절"
 
 
+def _ldjson_instock_matches_option(
+    raw: dict,
+    opt: OptionData,
+    offer_by_name: dict[str, dict],
+    offer_by_sku: dict[str, dict],
+) -> bool:
+    """ld+json Offer 항목이 InStock이면서 sku 또는 옵션명 조합이 일치할 때 True."""
+    item_code = str(raw.get("item_code") or "").strip()
+    if item_code:
+        off = offer_by_sku.get(item_code)
+        if off and off.get("in_stock"):
+            return True
+    for cand in (
+        "-".join(filter(None, [opt.opt1_name, opt.opt2_name, opt.opt3_name or ""])),
+        "-".join(filter(None, [opt.opt1_name, opt.opt2_name])),
+        (opt.opt1_name or "").strip(),
+    ):
+        if not cand:
+            continue
+        off = offer_by_name.get(cand)
+        if off and off.get("in_stock"):
+            return True
+    return False
+
+
 def parse_price(text: str) -> int:
     digits = re.sub(r"[^\d]", "", str(text))
     return int(digits) if digits else 0
@@ -472,6 +581,43 @@ def _db_retry(fn, *, max_retries: int = DB_MAX_RETRIES, delay: float = DB_RETRY_
             else:
                 raise
     raise last_exc  # 타입 체커 만족용 (실제 도달 불가)
+
+
+def _build_parsing_wing_option_insert_row(
+    wing_code: str,
+    o: OptionData,
+    existing: Optional[dict],
+    soldout_at: Optional[str],
+    resale_at: Optional[str],
+) -> dict:
+    """
+    parsing_wing_options DELETE 후 재삽입용 row.
+    동일 option_code가 이미 DB에 있었다면 opt1~3_name·display_opt*_name·display_manual은
+    기존 값을 유지하고(수동 표기 보존), 신규 option_code만 파싱값을 넣는다.
+    """
+    row: dict = {
+        "wing_code":   wing_code,
+        "option_code": o.option_code,
+        "option_cond": o.option_cond,
+        "stock_count": o.stock_count,
+        "soldout_at":  soldout_at,
+        "resale_at":   resale_at,
+    }
+    if o.add_price:
+        row["add_price"] = o.add_price
+    if existing is not None:
+        row["opt1_name"] = existing.get("opt1_name")
+        row["opt2_name"] = existing.get("opt2_name")
+        row["opt3_name"] = existing.get("opt3_name")
+        row["display_opt1_name"] = existing.get("display_opt1_name")
+        row["display_opt2_name"] = existing.get("display_opt2_name")
+        row["display_opt3_name"] = existing.get("display_opt3_name")
+        row["display_manual"]    = existing.get("display_manual")
+    else:
+        row["opt1_name"] = o.opt1_name
+        row["opt2_name"] = o.opt2_name or None
+        row["opt3_name"] = o.opt3_name or None
+    return row
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -679,15 +825,11 @@ async def scrape_product_detail(
     """
     상세 페이지에서 JS 변수 우선 추출, 없으면 DOM 폴백.
 
-    품절 판단 우선순위 (is_soldout_icon 및 is_selling 플래그 최우선):
-      [상품 레벨] is_soldout_icon='T' → product.soldout=True (강제 품절)
-              is_soldout_icon='F' (또는 미설정) → 개별 옵션 집계로 상품 상태 결정
-                → 판매중(1) 옵션이 1개라도 있으면 product.soldout=False
-                → 전체 품절(모두 2)이면 product.soldout=True
-      [옵션 레벨] is_selling='T' → option_cond=1(판매중)
-              is_selling='F' (또는 기타) → option_cond=2(품절)
-              stock_number / use_soldout / aSoldoutDisplay 완전 무시
-      ※ is_soldout_icon='T' 시 옵션 option_cond 강제 override 없음 (is_selling 결과 유지)
+    품절 판단:
+      [옵션] DETAIL_JS: is_selling='F' → 품절. is_selling='T'·재고>0 → 판매중. is_selling='T'·재고≤0 →
+             DOM 에서 해당 옵션이 disabled/품절 문구일 때만 품절(그 외는 주문 가능으로 간주).
+      [우선] ld+json Offer 의 availability 가 InStock 이면 위 결과보다 우선하여 판매중(1).
+      [상품] is_soldout_icon='T' → 강제 품절. 옵션 없음 + ld+json InStock → 목록 품절 신호 완화.
 
     추출 우선순위:
       1) JS 전역변수 (option_name_mapper → opt1~3_title, option_stock_data → 옵션목록)
@@ -728,10 +870,16 @@ async def scrape_product_detail(
     # ld+json offers → 옵션명(opt1-opt2-opt3) 기반 sku 맵 구성
     # sku는 option_code 보조용: option_stock_data item_code 없을 때 활용
     offer_by_name: dict[str, dict] = {}
+    offer_by_sku: dict[str, dict] = {}
     for off in offers_json:
         n = str(off.get("name") or "").strip()
         if n:
             offer_by_name[n] = off
+        sku = str(off.get("sku") or "").strip()
+        if sku:
+            offer_by_sku[sku] = off
+
+    any_offer_in_stock = bool(js.get("any_offer_in_stock", False))
 
     # ── 옵션 생성 ──────────────────────────────────────────────────────────
     options: list[OptionData] = []
@@ -781,28 +929,22 @@ async def scrape_product_detail(
         stock_raw = str(raw.get("stock_number") or "0").strip()
         stock     = int(stock_raw) if stock_raw.isdigit() else 0
 
-        # ── option_cond 결정 [is_soldout_icon 및 is_selling 플래그에 따른 상태 결정] ──
+        # ── option_cond 결정 [DETAIL_JS 가 정규화한 is_selling + option_selection_blocked 보조] ──
         #
-        # [신 오브젝트 형식] is_selling 단독 기반 (최우선):
-        #   is_selling='T' → 판매중(1)
-        #   is_selling='F' (또는 기타) → 품절(2)
-        #   use_soldout / stock_number : 완전 무시
-        #
-        # [구 배열 형식] option_disabled 기반 (is_selling 없음):
-        #   option_disabled='F' → 판매중(1), 'T' → 품절(2)
-        #   stock_number        : 동일하게 무시
+        # [신 오브젝트] JS: is_selling='F' → 품절. 'T' + 재고>0 → 판매중. 'T' + 재고≤0 → DOM 선택 막힘일 때만 품절.
+        # [구 배열] option_disabled ('T' = 막힘)
         #
         if "is_selling" in raw:
             _is_sel = raw.get("is_selling")
-            # 방어 기본값: is_selling 누락/None → 'T' (판매 중)
-            selling     = str(_is_sel if _is_sel is not None else "T").upper() == "T"
-            # is_selling='T' → 판매중(1), 그 외 → 품절(2)  (use_soldout 무시)
+            selling = str(_is_sel if _is_sel is not None else "T").upper() == "T"
+            if selling and raw.get("option_selection_blocked"):
+                selling = False
             option_cond = 1 if selling else 2
             log.debug(
-                "  ├ [is_soldout_icon 및 is_selling 플래그에 따른 상태 결정]"
-                " 옵션[%s] %s: is_selling=%r(%s) stock=%d(무시) use_soldout(무시) → %s",
+                "  ├ [is_selling·선택막힘]"
+                " 옵션[%s] %s: is_selling=%r blocked=%r stock=%d → %s",
                 option_code, opt1_name,
-                _is_sel, "T" if selling else "F",
+                _is_sel, raw.get("option_selection_blocked"),
                 stock, _cond_label(option_cond),
             )
         else:
@@ -828,14 +970,28 @@ async def scrape_product_detail(
             add_price   = add_price,
         ))
 
+    # ld+json availability=InStock 은 JS/DOM 판단보다 우선 → 매칭되면 항상 판매중(1)
+    for i, o in enumerate(options):
+        if i >= len(options_raw):
+            continue
+        raw_i = options_raw[i]
+        if _ldjson_instock_matches_option(raw_i, o, offer_by_name, offer_by_sku):
+            if o.option_cond != 1:
+                options[i] = replace(o, option_cond=1)
+                log.debug(
+                    "  ├ [ld+json InStock 우선] 옵션[%s] %s → 판매중",
+                    o.option_code, o.opt1_name,
+                )
+
     # 옵션 없는 단독 구매 상품 → "기본 옵션" 단일 행
     # is_totally_sold_out(=is_soldout_icon='T') 또는 목록 페이지 soldout 신호 기반
     if not options:
-        no_opt_cond = 2 if (is_totally_sold_out or item.soldout) else 1
+        no_opt_cond = 2 if (is_totally_sold_out or item.soldout) and not any_offer_in_stock else 1
         log.debug(
             "  ├ [is_soldout_icon 및 is_selling 플래그에 따른 상태 결정]"
-            " 옵션[기본] is_soldout_icon='%s'(totally=%s) item.soldout=%s → %s",
-            is_soldout_icon_str, is_totally_sold_out, item.soldout, _cond_label(no_opt_cond),
+            " 옵션[기본] is_soldout_icon='%s'(totally=%s) item.soldout=%s ld+json_instock=%s → %s",
+            is_soldout_icon_str, is_totally_sold_out, item.soldout, any_offer_in_stock,
+            _cond_label(no_opt_cond),
         )
         options.append(OptionData(
             option_code = f"{item.wing_code}-0001",
@@ -847,14 +1003,10 @@ async def scrape_product_detail(
             add_price   = 0,
         ))
 
-    # ── 최종 품절 판별 [is_soldout_icon 및 is_selling 플래그에 따른 상태 결정] ──
+    # ── 최종 품절 판별 [is_soldout_icon 및 옵션 option_cond 집계] ──
     #
-    # [1순위] is_soldout_icon='F' → 상품 강제 품절 (product.soldout=True)
-    #   옵션 option_cond 는 is_selling 플래그 결과 그대로 유지 (강제 덮어쓰기 없음)
-    #
-    # [2순위] is_soldout_icon='T' (또는 미설정)
-    #   판매중(1) 옵션이 1개라도 있으면 → soldout=False
-    #   전체 품절(모두 2)이면 → soldout=True
+    # is_soldout_icon='T' → 상품 강제 품절 (product.soldout=True)
+    # 그 외 → 판매중(1) 옵션 유무로 soldout 결정
     #
     selling_opts = [o for o in options if o.option_cond == 1]
     soldout_opts = [o for o in options if o.option_cond == 2]
@@ -970,8 +1122,9 @@ def fetch_existing_for_batch(
 
     반환:
         existing_prods      : wing_code → {prod_cond, retail_price}
-        existing_opts_by_wc : wing_code → {option_code → {option_cond, add_price,
-                                                           stock_count, soldout_at, resale_at}}
+        existing_opts_by_wc : wing_code → {option_code → 기존 옵션 필드 dict
+            (option_cond, add_price, stock_count, soldout_at, resale_at,
+             opt1~3_name, display_opt*_name, display_manual)}
     """
     existing_prods:      dict[str, dict]             = {}
     existing_opts_by_wc: dict[str, dict[str, dict]]  = {}
@@ -1001,7 +1154,9 @@ def fetch_existing_for_batch(
             lambda: supabase.table("parsing_wing_options")
             .select(
                 "wing_code, option_code, option_cond, "
-                "add_price, stock_count, soldout_at, resale_at"
+                "add_price, stock_count, soldout_at, resale_at, "
+                "opt1_name, opt2_name, opt3_name, "
+                "display_opt1_name, display_opt2_name, display_opt3_name, display_manual"
             )
             .in_("wing_code", wing_codes)
             .execute()
@@ -1016,6 +1171,13 @@ def fetch_existing_for_batch(
                     "stock_count": int(r.get("stock_count")  or 0),
                     "soldout_at":  r.get("soldout_at"),
                     "resale_at":   r.get("resale_at"),
+                    "opt1_name":   r.get("opt1_name"),
+                    "opt2_name":   r.get("opt2_name"),
+                    "opt3_name":   r.get("opt3_name"),
+                    "display_opt1_name": r.get("display_opt1_name"),
+                    "display_opt2_name": r.get("display_opt2_name"),
+                    "display_opt3_name": r.get("display_opt3_name"),
+                    "display_manual":    r.get("display_manual"),
                 }
     except Exception as exc:
         log.warning("배치 옵션 조회 실패 (옵션 맵 빈 채로 진행): %s", exc)
@@ -1042,6 +1204,10 @@ def save_products_batch(
 
     데이터 유실 방지:
       옵션 DELETE 후 INSERT 실패 시 상품별 개별 재삽입 시도(fallback).
+
+    갱신 정책:
+      기존 상품 upsert 시 display_opt*_title·display_manual·brand는 payload에서 제외.
+      기존 option_code는 opt*_name·display_opt*_name·display_manual을 DB 값으로 재삽입.
 
     반환: items 순서와 동일한 저장된 옵션 건수 리스트 (실패한 상품은 0)
     """
@@ -1141,6 +1307,16 @@ def save_products_batch(
                 prod_row["soldout_at"] = now
             elif old_prod_cond == 2 and new_cond == 1:
                 prod_row["resale_at"]  = now
+        # 기존 상품 upsert 시 수동 관리 컬럼은 절대 덮어쓰지 않음 (body에서 제거)
+        if not is_new:
+            for _k in (
+                "display_opt1_title",
+                "display_opt2_title",
+                "display_opt3_title",
+                "display_manual",
+                "brand",
+            ):
+                prod_row.pop(_k, None)
         prod_rows.append(prod_row)
 
         if is_new:
@@ -1149,33 +1325,28 @@ def save_products_batch(
         # 옵션 rows
         opt_rows_for_product: list[dict] = []
         for o in options:
-            ex           = existing_opts.get(o.option_code) or {}
-            old_opt_cond = int(ex.get("option_cond") or 1)
-            soldout_at: Optional[str] = ex.get("soldout_at")
-            resale_at:  Optional[str] = ex.get("resale_at")
+            ex_opt = existing_opts.get(o.option_code)
+            old_opt_cond = int((ex_opt or {}).get("option_cond") or 1)
+            soldout_at: Optional[str] = (
+                ex_opt.get("soldout_at") if ex_opt is not None else None
+            )
+            resale_at: Optional[str] = (
+                ex_opt.get("resale_at") if ex_opt is not None else None
+            )
 
-            if ex and old_opt_cond != o.option_cond:
+            if ex_opt is not None and old_opt_cond != o.option_cond:
                 if old_opt_cond == 1 and o.option_cond == 2:
                     soldout_at = now
                 elif old_opt_cond == 2 and o.option_cond == 1:
                     resale_at = now
-            elif not ex and o.option_cond == 2:
+            elif ex_opt is None and o.option_cond == 2:
                 soldout_at = now
 
-            opt_row: dict = {
-                "wing_code":   product.wing_code,
-                "option_code": o.option_code,
-                "opt1_name":   o.opt1_name,
-                "opt2_name":   o.opt2_name or None,
-                "opt3_name":   o.opt3_name or None,
-                "option_cond": o.option_cond,
-                "stock_count": o.stock_count,
-                "soldout_at":  soldout_at,
-                "resale_at":   resale_at,
-            }
-            if o.add_price:
-                opt_row["add_price"] = o.add_price
-            opt_rows_for_product.append(opt_row)
+            opt_rows_for_product.append(
+                _build_parsing_wing_option_insert_row(
+                    product.wing_code, o, ex_opt, soldout_at, resale_at
+                )
+            )
 
         all_opt_rows.extend(opt_rows_for_product)
         saved_counts.append(len(opt_rows_for_product))
@@ -1326,9 +1497,12 @@ def save_product_and_options(
       - prod_cond 변경 (1→2) → soldout_at = now
       - prod_cond 변경 (2→1) → resale_at = now
       - 어떤 변경이든 있으면 → update_at = now
+      - 기존 행 갱신 시 body에 포함되지 않는 컬럼은 DB값 유지
+        (display_opt1~3_title, display_manual, brand 등 수동 필드)
 
     옵션(parsing_wing_options):
       - 기존 옵션 전체 삭제 후 재삽입 (soldout_at / resale_at 기존 값 보존)
+      - 동일 option_code는 opt1~3_name·display_opt*_name·display_manual DB값 유지
       - option_cond 변경 (1→2) → soldout_at = now
       - option_cond 변경 (2→1) → resale_at = now
 
@@ -1364,11 +1538,15 @@ def save_product_and_options(
     )
 
     # ── 2. 기존 옵션 조회 ─────────────────────────────────────────────────
-    # {option_code: {option_cond, add_price, stock_count, soldout_at, resale_at}}
+    # {option_code: … opt1~3_name, display_*, soldout_at 등}
     existing_opts: dict[str, dict] = {}
     ex_opts_resp = (
         supabase.table("parsing_wing_options")
-        .select("option_code, option_cond, add_price, stock_count, soldout_at, resale_at")
+        .select(
+            "option_code, option_cond, add_price, stock_count, soldout_at, resale_at, "
+            "opt1_name, opt2_name, opt3_name, "
+            "display_opt1_name, display_opt2_name, display_opt3_name, display_manual"
+        )
         .eq("wing_code", product.wing_code)
         .execute()
     )
@@ -1381,6 +1559,13 @@ def save_product_and_options(
                 "stock_count": int(r.get("stock_count")  or 0),
                 "soldout_at":  r.get("soldout_at"),
                 "resale_at":   r.get("resale_at"),
+                "opt1_name":   r.get("opt1_name"),
+                "opt2_name":   r.get("opt2_name"),
+                "opt3_name":   r.get("opt3_name"),
+                "display_opt1_name": r.get("display_opt1_name"),
+                "display_opt2_name": r.get("display_opt2_name"),
+                "display_opt3_name": r.get("display_opt3_name"),
+                "display_manual":    r.get("display_manual"),
             }
 
     # ── 3. 옵션 변경 사항 수집 ────────────────────────────────────────────
@@ -1459,6 +1644,16 @@ def save_product_and_options(
         elif old_prod_cond == 2 and new_cond == 1:
             prod_row["resale_at"]  = now
 
+    if not is_new:
+        for _k in (
+            "display_opt1_title",
+            "display_opt2_title",
+            "display_opt3_title",
+            "display_manual",
+            "brand",
+        ):
+            prod_row.pop(_k, None)
+
     _db_retry(
         lambda: supabase.table("parsing_wing_products")
         .upsert(prod_row, on_conflict="wing_code")
@@ -1531,34 +1726,29 @@ def save_product_and_options(
 
     opt_rows: list[dict] = []
     for o in options:
-        ex           = existing_opts.get(o.option_code) or {}
-        old_opt_cond = int(ex.get("option_cond") or 1)
+        ex_opt = existing_opts.get(o.option_code)
+        old_opt_cond = int((ex_opt or {}).get("option_cond") or 1)
 
-        soldout_at: Optional[str] = ex.get("soldout_at")
-        resale_at:  Optional[str] = ex.get("resale_at")
+        soldout_at: Optional[str] = (
+            ex_opt.get("soldout_at") if ex_opt is not None else None
+        )
+        resale_at: Optional[str] = (
+            ex_opt.get("resale_at") if ex_opt is not None else None
+        )
 
-        if ex and old_opt_cond != o.option_cond:
+        if ex_opt is not None and old_opt_cond != o.option_cond:
             if old_opt_cond == 1 and o.option_cond == 2:
                 soldout_at = now
             elif old_opt_cond == 2 and o.option_cond == 1:
                 resale_at = now
-        elif not ex and o.option_cond == 2:
+        elif ex_opt is None and o.option_cond == 2:
             soldout_at = now
 
-        opt_row: dict = {
-            "wing_code":    product.wing_code,
-            "option_code":  o.option_code,
-            "opt1_name":    o.opt1_name,
-            "opt2_name":    o.opt2_name or None,
-            "opt3_name":    o.opt3_name or None,
-            "option_cond":  o.option_cond,
-            "stock_count":  o.stock_count,
-            "soldout_at":   soldout_at,
-            "resale_at":    resale_at,
-        }
-        if o.add_price:
-            opt_row["add_price"] = o.add_price
-        opt_rows.append(opt_row)
+        opt_rows.append(
+            _build_parsing_wing_option_insert_row(
+                product.wing_code, o, ex_opt, soldout_at, resale_at
+            )
+        )
 
     if opt_rows:
         _db_retry(
